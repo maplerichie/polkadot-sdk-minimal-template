@@ -28,8 +28,8 @@ pub mod pallet {
     pub type TotalIssuance<T: Config> = StorageValue<_, Balance>;
 
     #[pallet::storage]
-    // pub type Balances<T: Config> = StorageMap<_, _, T::AccountId, Balance>;
-    pub type Balances<T: Config> = StorageMap<Key = T::AccountId, Value = Balance>;
+    pub type Balances<T: Config> = StorageMap<_, _, T::AccountId, Balance>;
+    // pub type Balances<T: Config> = StorageMap<Key = T::AccountId, Value = Balance>;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -97,5 +97,183 @@ pub mod pallet {
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{pallet as pallet_currency, *};
+    use frame::testing_prelude::*;
+
+    construct_runtime!(
+        pub enum Runtime {
+            System: frame_system,
+            Pallet: pallet_currency
+        }
+    );
+
+    #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+    impl frame_system::Config for Runtime {
+        type Block = MockBlock<Runtime>;
+        type AccountId = u64;
+    }
+
+    // our simple pallet has nothing to be configured.
+    impl pallet_currency::Config for Runtime {
+        type RuntimeEvent = RuntimeEvent;
+    }
+
+    const ALICE: <Runtime as frame_system::Config>::AccountId = 0;
+    const BOB: <Runtime as frame_system::Config>::AccountId = 1;
+    const CHARLIE: <Runtime as frame_system::Config>::AccountId = 2;
+
+    pub(crate) struct StateBuilder {
+        balances: Vec<(<Runtime as frame_system::Config>::AccountId, Balance)>,
+    }
+
+    impl Default for StateBuilder {
+        fn default() -> Self {
+            Self {
+                balances: vec![(ALICE, 100), (BOB, 100)],
+            }
+        }
+    }
+
+    impl StateBuilder {
+        pub(crate) fn build_and_execute(self, test: impl FnOnce() -> ()) {
+            let mut ext = TestState::new_empty();
+            ext.execute_with(|| {
+                for (who, amount) in &self.balances {
+                    Balances::<Runtime>::insert(who, amount);
+                    TotalIssuance::<Runtime>::mutate(|b| *b = Some(b.unwrap_or(0) + amount));
+                }
+            });
+
+            ext.execute_with(test);
+
+            // assertions that must always hold
+            ext.execute_with(|| {
+                assert_eq!(
+                    Balances::<Runtime>::iter().map(|(_, x)| x).sum::<u128>(),
+                    TotalIssuance::<Runtime>::get().unwrap_or_default()
+                );
+            })
+        }
+    }
+
+    impl StateBuilder {
+        fn add_balance(
+            mut self,
+            who: <Runtime as frame_system::Config>::AccountId,
+            amount: Balance,
+        ) -> Self {
+            self.balances.push((who, amount));
+            self
+        }
+    }
+
+    #[test]
+    fn state_builder_works() {
+        StateBuilder::default().build_and_execute(|| {
+            assert_eq!(Balances::<Runtime>::get(&ALICE), Some(100));
+            assert_eq!(Balances::<Runtime>::get(&BOB), Some(100));
+            assert_eq!(Balances::<Runtime>::get(&CHARLIE), None);
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(200));
+        });
+    }
+
+    #[test]
+    fn state_builder_add_balance() {
+        StateBuilder::default()
+            .add_balance(CHARLIE, 42)
+            .build_and_execute(|| {
+                assert_eq!(Balances::<Runtime>::get(&CHARLIE), Some(42));
+                assert_eq!(TotalIssuance::<Runtime>::get(), Some(242));
+            })
+    }
+
+    #[test]
+    fn mint_works() {
+        StateBuilder::default().build_and_execute(|| {
+            // given the initial state, when:
+            assert_ok!(Pallet::mint_unsafe(RuntimeOrigin::signed(ALICE), BOB, 100));
+
+            // then:
+            assert_eq!(Balances::<Runtime>::get(&BOB), Some(200));
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(300));
+
+            // given:
+            assert_ok!(Pallet::mint_unsafe(
+                RuntimeOrigin::signed(ALICE),
+                CHARLIE,
+                100
+            ));
+
+            // then:
+            assert_eq!(Balances::<Runtime>::get(&CHARLIE), Some(100));
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(400));
+        });
+    }
+
+    #[test]
+    fn transfer_works() {
+        StateBuilder::default().build_and_execute(|| {
+            // given the the initial state, when:
+            assert_ok!(Pallet::transfer(RuntimeOrigin::signed(ALICE), BOB, 50));
+
+            // then:
+            assert_eq!(Balances::<Runtime>::get(&ALICE), Some(50));
+            assert_eq!(Balances::<Runtime>::get(&BOB), Some(150));
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(200));
+
+            System::set_block_number(1);
+            // when:
+            assert_ok!(Pallet::transfer(RuntimeOrigin::signed(BOB), ALICE, 50));
+
+            // test event
+            System::assert_has_event(
+                Event::Transferred {
+                    from: BOB,
+                    to: ALICE,
+                    amount: 50,
+                }
+                .into(),
+            );
+
+            // then:
+            assert_eq!(Balances::<Runtime>::get(&ALICE), Some(100));
+            assert_eq!(Balances::<Runtime>::get(&BOB), Some(100));
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(200));
+        });
+    }
+
+    #[test]
+    fn transfer_from_non_existent_fails() {
+        StateBuilder::default().build_and_execute(|| {
+            // given the the initial state, when:
+            assert_err!(
+                Pallet::transfer(RuntimeOrigin::signed(CHARLIE), ALICE, 10),
+                Error::<Runtime>::NonExistentAccount
+            );
+
+            // then nothing has changed.
+            assert_eq!(Balances::<Runtime>::get(&ALICE), Some(100));
+            assert_eq!(Balances::<Runtime>::get(&BOB), Some(100));
+            assert_eq!(Balances::<Runtime>::get(&CHARLIE), None);
+            assert_eq!(TotalIssuance::<Runtime>::get(), Some(200));
+        });
+    }
+
+    #[test]
+    fn transfer_exceed_balance_fails() {
+        StateBuilder::default().build_and_execute(|| {
+            // then nothing has changed.
+            assert_eq!(Balances::<Runtime>::get(&ALICE), Some(100));
+
+            assert_err!(
+                Pallet::transfer(RuntimeOrigin::signed(ALICE), BOB, 101),
+                Error::<Runtime>::InsufficientBalance
+            );
+        });
     }
 }
